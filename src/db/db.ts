@@ -5,6 +5,7 @@ import mysql from "mysql2/promise";
 import bcrypt from "bcryptjs";
 import express from "express";
 import { FileStorage } from "./fileStorage";
+import { ADMIN_PHONE, ADMIN_DISPLAY_NAME, isAdminLikeId } from "../config/admin";
 
 export const UPLOADS_DIR = path.join(process.cwd(), "public", "uploads");
 export const BACKUPS_DIR = path.join(process.cwd(), "public", "uploads", "backups");
@@ -946,16 +947,29 @@ export function hashPassword(plainText: string): string {
   return bcrypt.hashSync(plainText, salt);
 }
 
+/** مقایسه دو رشته در زمان ثابت تا از حمله timing جلوگیری شود. */
+function timingSafeCompare(a: string, b: string): boolean {
+  const bufA = Buffer.from(String(a || ""), "utf8");
+  const bufB = Buffer.from(String(b || ""), "utf8");
+  if (bufA.length !== bufB.length) return false;
+  try {
+    return crypto.timingSafeEqual(bufA, bufB);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * اعتبارسنجی رمز عبور در برابر مقدار ذخیره‌شده.
+ *
+ * @param password رمز خام واردشده توسط کاربر.
+ * @param hash مقدار ذخیره‌شده در دیتابیس.
+ * @returns true در صورت تطابق.
+ */
 export function verifyPassword(password: string, hash: string): boolean {
   if (!password || !hash) return false;
 
-  // 1. Direct plaintext match — فقط برای رمزهای قدیمیِ خام، نه برای هشهای واقعی
-  const looksHashed =
-    hash.startsWith("$2a$") || hash.startsWith("$2b$") || hash.startsWith("$2y$") ||
-    /^[a-fA-F0-9]{32}$/.test(hash) || /^[a-fA-F0-9]{64}$/.test(hash);
-  if (!looksHashed && password === hash) return true;
-
-  // 2. Bcrypt match ($2a$, $2b$, $2y$)
+  // 1. Bcrypt — تنها الگوریتم مورد قبول برای رمزهای جدید
   if (hash.startsWith("$2a$") || hash.startsWith("$2b$") || hash.startsWith("$2y$")) {
     try {
       return bcrypt.compareSync(password, hash);
@@ -964,37 +978,32 @@ export function verifyPassword(password: string, hash: string): boolean {
     }
   }
 
-  // 3. MD5 hash check (32 hex characters)
-  if (hash.length === 32 && /^[a-fA-F0-9]{32}$/.test(hash)) {
-    try {
-      const md5 = crypto.createHash("md5").update(password).digest("hex");
-      if (md5.toLowerCase() === hash.toLowerCase()) return true;
-    } catch {}
+  // 2. هش‌های ضعیف MD5/SHA256 (بدون salt) دیگر پذیرفته نمی‌شوند — با جدول rainbow
+  // در چند ثانیه شکسته می‌شوند. کاربر باید از مسیر «فراموشی رمز» رمز جدید بگیرد.
+  if (/^[a-fA-F0-9]{32}$/.test(hash) || /^[a-fA-F0-9]{64}$/.test(hash)) {
+    console.warn("[verifyPassword] رمز با الگوریتم ضعیف ذخیره شده و رد شد؛ نیاز به بازنشانی رمز.");
+    return false;
   }
 
-  // 4. SHA256 hash check (64 hex characters)
-  if (hash.length === 64 && /^[a-fA-F0-9]{64}$/.test(hash)) {
-    try {
-      const sha256 = crypto.createHash("sha256").update(password).digest("hex");
-      if (sha256.toLowerCase() === hash.toLowerCase()) return true;
-    } catch {}
-  }
-
-  return false;
+  // 3. رمز خامِ میراثی — مقایسه در زمان ثابت، و باید در اولین ورود موفق rehash شود.
+  return timingSafeCompare(password, hash);
 }
 
 /**
- * Legacy escape hatch: set ALLOW_LEGACY_ID_AUTH=true in the server .env to restore
- * the previous behaviour where sending the admin user-id as a token was enough to
- * be treated as the super admin. Off by default.
+ * آیا مقدار ذخیره‌شده نیازمند ارتقا به bcrypt است؟
+ * پس از هر ورود موفق فراخوانی کنید و در صورت true رمز را دوباره هش کنید.
+ *
+ * @param hash مقدار فعلی ذخیره‌شده در دیتابیس.
  */
-const allowLegacyIdAuth = String(process.env.ALLOW_LEGACY_ID_AUTH || "").toLowerCase() === "true";
-
-/** True when the given value is an admin identifier rather than a real session token. */
-function isAdminLikeId(value: string | null | undefined): boolean {
-  const v = String(value || "").trim();
-  return v === "admin" || v === "us_admin_root" || v.startsWith("us_admin");
+export function needsRehash(hash: string | null | undefined): boolean {
+  const h = String(hash || "").trim();
+  if (!h) return false;
+  return !(h.startsWith("$2a$") || h.startsWith("$2b$") || h.startsWith("$2y$"));
 }
+
+// یادداشت امنیتی: کلید `ALLOW_LEGACY_ID_AUTH` به‌طور کامل حذف شد. این کلید اجازه می‌داد
+// هر کسی صرفاً با فرستادن رشتهٔ «us_admin_root» در یک هدر، مدیر کل شناخته شود.
+// هویت مدیر از این پس فقط از یک سشن معتبرِ ثبت‌شده در جدول `sessions` می‌آید.
 
 /**
  * In-process copy of every session token issued by this server.
@@ -1063,41 +1072,15 @@ export async function getCurrentUserAsync(req: express.Request): Promise<any | n
     rawSessionUserId = headerTokenStr;
   }
 
-  // Root admin shortcut - only available when the legacy id-auth escape hatch is enabled.
-  // Normally the admin identity must come from a real server-issued session (see below).
-  if (allowLegacyIdAuth && (rawAccessToken === 'us_admin_root' || rawSessionUserId === 'us_admin_root' || headerTokenStr === 'us_admin_root')) {
-    return setAndReturn({
-      id: "us_admin_root",
-      full_name: "مدیر عالی پلتفرم",
-      name: "مدیر عالی پلتفرم",
-      role: "admin",
-      is_super_admin: 1,
-      isSuperAdmin: true,
-      phone: "09120947304",
-      has_active_subscription: true,
-      is_premium: true,
-      status: "active"
-    });
-  }
-
+  /**
+   * حل هویت از روی FileStorage — فقط برای کاربران عادی در حالت افت دیتابیس.
+   * هرگز هویت مدیر را از این مسیر برنمی‌گرداند؛ دسترسی مدیر فقط با سشن معتبر ممکن است.
+   */
   const resolveFromFileStorage = (idOrToken: string | null) => {
     if (!idOrToken || idOrToken === 'undefined' || idOrToken === 'null' || idOrToken === 'guest' || idOrToken === '0') return null;
     const clean = idOrToken.trim();
-    if (isAdminLikeId(clean) && !allowLegacyIdAuth) return null;
-    if (clean === 'us_admin_root') {
-      return {
-        id: "us_admin_root",
-        full_name: "مدیر عالی پلتفرم",
-        name: "مدیر عالی پلتفرم",
-        role: "admin",
-        is_super_admin: 1,
-        isSuperAdmin: true,
-        phone: "09120947304",
-        has_active_subscription: true,
-        is_premium: true,
-        status: "active"
-      };
-    }
+    // مسدودسازی قطعی: شناسه‌های شبیه‌مدیر هرگز از روی فایل حل نمی‌شوند.
+    if (isAdminLikeId(clean)) return null;
     const fsUser = FileStorage.findUserById(clean) || FileStorage.findUserByPhone(clean);
     if (fsUser) {
       return {
@@ -1126,7 +1109,7 @@ export async function getCurrentUserAsync(req: express.Request): Promise<any | n
     const p = getDbPool();
     let verifiedUserId: string | null = null;
     // True only when the admin identity came from a real session row in the database.
-    let isAdminSessionVerified = allowLegacyIdAuth;
+    let isAdminSessionVerified = false;
 
     // 1. If access token is provided, verify against sessions table
     if (rawAccessToken && rawAccessToken !== 'undefined' && rawAccessToken !== 'null') {
@@ -1169,22 +1152,9 @@ export async function getCurrentUserAsync(req: express.Request): Promise<any | n
     }
 
     const cleanUserId = verifiedUserId.trim();
+    // هویت مدیر فقط وقتی پذیرفته می‌شود که از یک سشن واقعیِ ثبت‌شده آمده باشد.
     if (isAdminLikeId(cleanUserId) && !isAdminSessionVerified) {
       return setAndReturn(null);
-    }
-    if (cleanUserId === 'us_admin_root') {
-      return setAndReturn({
-        id: "us_admin_root",
-        full_name: "مدیر عالی پلتفرم",
-        name: "مدیر عالی پلتفرم",
-        role: "admin",
-        is_super_admin: 1,
-        isSuperAdmin: true,
-        phone: "09120947304",
-        has_active_subscription: true,
-        is_premium: true,
-        status: "active"
-      });
     }
 
     let [userRows]: any = await p.query("SELECT * FROM users WHERE id = ? OR user_code = ? LIMIT 1", [cleanUserId, cleanUserId]);
@@ -1418,9 +1388,12 @@ export async function getCurrentUserAsync(req: express.Request): Promise<any | n
         payments: techPayments
       });
     }
-    if (cleanUserId === "admin" || cleanUserId === "us_admin_root" || cleanUserId.startsWith("us_admin")) {
+    // وقتی شناسه مدیر از یک سشن معتبر آمده ولی رکورد کاربر پیدا نشده است.
+    // شرط isAdminSessionVerified بالاتر تضمین شده است.
+    if (isAdminLikeId(cleanUserId)) {
       const [adminRows]: any = await p.query(
-        "SELECT * FROM users WHERE role = 'admin' OR is_super_admin = 1 OR phone = '09120947304' LIMIT 1"
+        "SELECT * FROM users WHERE role = 'admin' OR is_super_admin = 1 OR phone = ? LIMIT 1",
+        [ADMIN_PHONE]
       ).catch(() => [[], []]);
       if (adminRows && adminRows.length > 0) {
         const u = adminRows[0];
@@ -1432,9 +1405,9 @@ export async function getCurrentUserAsync(req: express.Request): Promise<any | n
       }
       return setAndReturn({
         id: cleanUserId,
-        phone: "09120947304",
-        full_name: "مدیر کل پلتفرم",
-        name: "مدیر کل پلتفرم",
+        phone: ADMIN_PHONE,
+        full_name: ADMIN_DISPLAY_NAME,
+        name: ADMIN_DISPLAY_NAME,
         role: "admin",
         is_super_admin: 1,
         isSuperAdmin: true,
@@ -1444,19 +1417,6 @@ export async function getCurrentUserAsync(req: express.Request): Promise<any | n
   } catch (err: any) {
     setMySqlOffline(true);
     console.warn("[getCurrentUserAsync] Error fetching user:", err.message);
-  }
-
-  if (allowLegacyIdAuth && isAdminLikeId(rawSessionUserId)) {
-    return setAndReturn({
-      id: rawSessionUserId || "us_admin_root",
-      phone: "09120947304",
-      full_name: "مدیر کل پلتفرم",
-      name: "مدیر کل پلتفرم",
-      role: "admin",
-      is_super_admin: 1,
-      isSuperAdmin: true,
-      city: "تهران"
-    });
   }
 
   return setAndReturn(null);
@@ -1475,19 +1435,9 @@ export function getCurrentUser(req: express.Request, db?: any): any {
       : (req.headers["x-session-token"] as string);
   }
 
-  if (allowLegacyIdAuth && isAdminLikeId(sessionUserId)) {
-    return {
-      id: sessionUserId,
-      phone: "09120947304",
-      full_name: "مدیریت عالی کدیار۲۴",
-      name: "مدیریت عالی کدیار۲۴",
-      role: "admin",
-      is_super_admin: true,
-      isSuperAdmin: true,
-      city: "تهران"
-    };
-  }
-
+  // هرگز هویت مدیر را به‌صورت هم‌زمان و بدون بررسی جدول sessions برنمی‌گردانیم.
+  // برای احراز هویت واقعی از getCurrentUserAsync استفاده کنید.
+  void sessionUserId;
   return null;
 }
 

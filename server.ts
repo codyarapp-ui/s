@@ -5,10 +5,11 @@ import fs from "fs";
 import compression from "compression";
 import { createServer as createViteServer } from "vite";
 
-import { checkDbConnection, getCurrentUserAsync, verifyPassword, hashPassword, getDbPool, rememberSession, forgetSession } from "./src/db/db";
+import { checkDbConnection, getCurrentUserAsync, verifyPassword, hashPassword, needsRehash, getDbPool, rememberSession, forgetSession } from "./src/db/db";
 import { getNextSequentialId } from "./src/db/idHelper";
 import { FileStorage } from "./src/db/fileStorage";
 import { requireAdmin } from "./src/middleware/admin";
+import { ADMIN_PHONE, ADMIN_ROOT_ID, ADMIN_DISPLAY_NAME, isAdminUser } from "./src/config/admin";
 import { SessionRepository } from "./src/repositories/sessions";
 import crypto from "crypto";
 import { diagnoseErrorCode, suggestPartsForError } from "./src/services/gemini";
@@ -58,7 +59,8 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
   }
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Token, X-Admin-Token, X-Admin-Password, X-Access-Token, X-Requested-With, Accept");
+  // X-Admin-Token و X-Admin-Password از فهرست حذف شدند — دیگر در هیچ مسیری پذیرفته نمی‌شوند.
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Token, X-Access-Token, X-Requested-With, Accept");
   res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Type");
   if (req.method === "OPTIONS") {
     return res.sendStatus(200);
@@ -105,14 +107,65 @@ app.use((req, res, next) => {
   next();
 });
 
+/** آیا مقدار داده‌شده یک هش رمز است (bcrypt / md5 / sha256) یا متن خام؟ */
+function isHashedSecret(value: string): boolean {
+  return (
+    value.startsWith("$2a$") || value.startsWith("$2b$") || value.startsWith("$2y$") ||
+    /^[a-fA-F0-9]{32}$/.test(value) || /^[a-fA-F0-9]{64}$/.test(value)
+  );
+}
+
+/** مقایسه دو رشته در زمان ثابت تا از حمله timing جلوگیری شود. */
+function safeEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(String(a || ""), "utf8");
+  const bufB = Buffer.from(String(b || ""), "utf8");
+  if (bufA.length !== bufB.length) return false;
+  try {
+    return crypto.timingSafeEqual(bufA, bufB);
+  } catch {
+    return false;
+  }
+}
+
+/** IP واقعی درخواست‌کننده، با احتساب پراکسی. */
+function clientIp(req: express.Request): string {
+  return String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown").split(",")[0].trim();
+}
+
 // 3. In-memory Rate Limiter for Authentication & Sensitive endpoints (Brute Force Protection)
-const authRateLimitMap = new Map<string, { count: number; resetAt: number }>();
-function createRateLimiter(maxAttempts = 15, windowMs = 60 * 1000) {
+// یادداشت: این محدودکننده in-process است؛ در استقرار چند-اینستنسی باید به Redis منتقل شود.
+const authRateLimitMap = new Map<string, { count: number; resetAt: number; blockedUntil?: number }>();
+
+// جلوگیری از رشد بی‌نهایت Map (نشت حافظه تحت حمله با IP متغیر)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, rec] of authRateLimitMap) {
+    if (rec.resetAt < now && (!rec.blockedUntil || rec.blockedUntil < now)) {
+      authRateLimitMap.delete(key);
+    }
+  }
+}, 5 * 60 * 1000).unref?.();
+
+/**
+ * محدودکننده نرخ درخواست برای مسیرهای حساس.
+ *
+ * @param maxAttempts حداکثر تلاش در بازه زمانی.
+ * @param windowMs طول بازه زمانی به میلی‌ثانیه.
+ * @param blockMs مدت قفل پس از عبور از سقف (صفر = فقط تا پایان بازه).
+ */
+function createRateLimiter(maxAttempts = 15, windowMs = 60 * 1000, blockMs = 0) {
   return (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown").split(",")[0].trim();
-    const key = `${req.path}:${ip}`;
+    const key = `${req.path}:${clientIp(req)}`;
     const now = Date.now();
     const record = authRateLimitMap.get(key);
+
+    if (record?.blockedUntil && record.blockedUntil > now) {
+      const waitSec = Math.ceil((record.blockedUntil - now) / 1000);
+      return res.status(429).json({
+        status: "error",
+        message: `تعداد تلاش‌های ناموفق بیش از حد مجاز است. دسترسی شما تا ${waitSec} ثانیه دیگر موقتاً مسدود است.`
+      });
+    }
 
     if (!record || record.resetAt < now) {
       authRateLimitMap.set(key, { count: 1, resetAt: now + windowMs });
@@ -120,7 +173,10 @@ function createRateLimiter(maxAttempts = 15, windowMs = 60 * 1000) {
     }
 
     if (record.count >= maxAttempts) {
-      const waitSec = Math.ceil((record.resetAt - now) / 1000);
+      if (blockMs > 0) {
+        record.blockedUntil = now + blockMs;
+      }
+      const waitSec = Math.ceil(((record.blockedUntil || record.resetAt) - now) / 1000);
       return res.status(429).json({
         status: "error",
         message: `تعداد درخواست‌های بیش از حد مجاز. لطفاً ${waitSec} ثانیه دیگر مجدداً تلاش نمایید.`
@@ -132,7 +188,9 @@ function createRateLimiter(maxAttempts = 15, windowMs = 60 * 1000) {
   };
 }
 
-const authRateLimit = createRateLimiter(15, 60 * 1000); // 15 requests per minute for login/admin-login
+const authRateLimit = createRateLimiter(15, 60 * 1000); // 15 requests per minute for login
+// ورود مدیر هدف اصلی brute-force است → سقف بسیار پایین‌تر با قفل ۱۵ دقیقه‌ای
+const adminLoginRateLimit = createRateLimiter(5, 10 * 60 * 1000, 15 * 60 * 1000);
 const otpRateLimit = createRateLimiter(5, 60 * 1000);   // 5 OTP requests per minute
 
 // Activity Logger Helper to track all user actions into database
@@ -549,9 +607,9 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-app.post("/api/auth/admin-login", authRateLimit, async (req, res) => {
+app.post("/api/auth/admin-login", adminLoginRateLimit, async (req, res) => {
   try {
-    const { password, localAdminPassword } = req.body || {};
+    const { password } = req.body || {};
     if (!password || !String(password).trim()) {
       return res.status(400).json({ status: "error", error: "کلمه عبور الزامی است" });
     }
@@ -573,83 +631,64 @@ app.post("/api/auth/admin-login", authRateLimit, async (req, res) => {
         .trim();
 
     const normalizedInput = normalizeDigits(rawInput);
-    const candidateInputs = Array.from(new Set([rawInput, normalizedInput, rawInput.toLowerCase(), normalizedInput.toLowerCase()]));
 
     const pool = getDbPool();
-    // 1. Get stored admin password from settings table
+
+    // ------------------------------------------------------------------
+    // اعتبارسنجی رمز مدیر.
+    //
+    // فقط منابعی که *سمت سرور* ذخیره شده‌اند پذیرفته می‌شوند:
+    //   1. هش رمز کاربرِ مدیر در جدول users  (منبع اصلی)
+    //   2. مقدار ذخیره‌شده در جدول settings   (میراث - پس از ورود ارتقا می‌یابد)
+    //   3. متغیر محیطی ADMIN_PASSWORD        (برای بازیابی اضطراری)
+    //
+    // حذف شد: رمزی که خودِ کلاینت در body می‌فرستاد (localAdminPassword) و
+    // لیست ADMIN_MASTER_PASSWORDS — هر دو عملاً دور زدن احراز هویت بودند.
+    // ------------------------------------------------------------------
     const [settingRows]: any = await pool.query(
       "SELECT setting_value FROM settings WHERE setting_key IN ('adminPassword', 'admin_password') LIMIT 1"
     ).catch(() => [[], []]);
     const storedSettingPass = settingRows && settingRows.length > 0 ? settingRows[0].setting_value : null;
 
-    // 2. Get stored password from FileStorage
-    const fileSettings = FileStorage.getSettings ? FileStorage.getSettings() : {};
-    const fileAdminPass = fileSettings?.adminPassword || fileSettings?.admin_password || null;
-
-    // 3. Get super admin user from users table or FileStorage
-    let adminUser = await UserRepository.findByPhoneWithPassword("09120947304").catch(() => null);
+    let adminUser = await UserRepository.findByPhoneWithPassword(ADMIN_PHONE).catch(() => null);
     if (!adminUser) {
-      adminUser = FileStorage.findUserByPhone("09120947304") || FileStorage.findUserById("us_admin_root");
+      adminUser = FileStorage.findUserByPhone(ADMIN_PHONE) || FileStorage.findUserById(ADMIN_ROOT_ID);
     }
     const userPassHash = adminUser?.password_hash || adminUser?.password || null;
-
-    // 4. Optional env variable (fallback)
     const envAdminPass = process.env.ADMIN_PASSWORD;
 
-    // 5. Optional master password, provided only through the server .env file
-    const allowedMasterFallbacks = String(process.env.ADMIN_MASTER_PASSWORDS || "")
-      .split(",")
-      .map((item) => item.trim())
-      .filter(Boolean);
-
-    let isMatch = false;
-
-    // Helper to check candidate against target
-    const checkCandidateAgainst = (target: string | null | undefined): boolean => {
+    /** مقایسه ورودی با یک مقدار ذخیره‌شده سمت سرور (هش یا رمز خام میراثی). */
+    const checkStored = (target: string | null | undefined): boolean => {
       if (!target) return false;
       const cleanTarget = String(target).trim();
-      const normTarget = normalizeDigits(cleanTarget);
-      for (const input of candidateInputs) {
-        if (input === cleanTarget || input === normTarget) return true;
-        try {
-          if (verifyPassword(input, cleanTarget)) return true;
-        } catch {}
+      if (!cleanTarget) return false;
+      // رمز هش‌شده → مقایسه از طریق bcrypt
+      if (isHashedSecret(cleanTarget)) {
+        return verifyPassword(rawInput, cleanTarget) || verifyPassword(normalizedInput, cleanTarget);
       }
-      return false;
+      // رمز خام میراثی → مقایسه زمان‌ثابت تا نشت اطلاعات از طریق زمان پاسخ رخ ندهد
+      return safeEqual(rawInput, cleanTarget) || safeEqual(normalizedInput, cleanTarget);
     };
 
-    if (storedSettingPass && checkCandidateAgainst(storedSettingPass)) {
+    let isMatch = false;
+    /** آیا رمز از یک منبعِ ذخیره‌شده به‌صورت خام آمده و باید به bcrypt ارتقا یابد؟ */
+    let needsHashUpgrade = false;
+
+    if (userPassHash && checkStored(userPassHash)) {
       isMatch = true;
+      if (!isHashedSecret(String(userPassHash).trim())) needsHashUpgrade = true;
     }
-    if (!isMatch && fileAdminPass && checkCandidateAgainst(fileAdminPass)) {
+    if (!isMatch && storedSettingPass && checkStored(storedSettingPass)) {
       isMatch = true;
+      needsHashUpgrade = true;
     }
-    if (!isMatch && userPassHash && checkCandidateAgainst(userPassHash)) {
+    if (!isMatch && envAdminPass && checkStored(envAdminPass)) {
       isMatch = true;
-    }
-    if (!isMatch && envAdminPass && checkCandidateAgainst(envAdminPass)) {
-      isMatch = true;
-    }
-    if (!isMatch && localAdminPassword && checkCandidateAgainst(localAdminPassword)) {
-      isMatch = true;
-    }
-    if (!isMatch) {
-      for (const fallback of allowedMasterFallbacks) {
-        if (checkCandidateAgainst(fallback)) {
-          isMatch = true;
-          break;
-        }
-      }
+      needsHashUpgrade = true;
     }
 
     if (isMatch) {
       let targetAdminUser = adminUser;
-      if (!targetAdminUser) {
-        targetAdminUser = await UserRepository.findByPhoneWithPassword("09120947304").catch(() => null);
-      }
-      if (!targetAdminUser) {
-        targetAdminUser = FileStorage.findUserByPhone("09120947304") || FileStorage.findUserById("us_admin_root");
-      }
       if (!targetAdminUser) {
         const [admRows]: any = await pool.query("SELECT * FROM users WHERE role = 'admin' OR is_super_admin = 1 LIMIT 1").catch(() => [[], []]);
         if (admRows && admRows.length > 0) {
@@ -658,32 +697,39 @@ app.post("/api/auth/admin-login", authRateLimit, async (req, res) => {
       }
       if (!targetAdminUser) {
         targetAdminUser = await UserRepository.create({
-          id: "us_admin_root",
+          id: ADMIN_ROOT_ID,
           user_code: "US-ADM-01",
-          phone: "09120947304",
-          full_name: "مدیر کل پلتفرم",
+          phone: ADMIN_PHONE,
+          full_name: ADMIN_DISPLAY_NAME,
           role: "admin",
           is_super_admin: true,
           password_hash: hashPassword(rawInput)
         }).catch(() => null);
+        needsHashUpgrade = false;
       }
 
-      // Ensure FileStorage has the admin password saved
-      try {
-        FileStorage.setSetting("adminPassword", rawInput);
-      } catch {}
+      const adminId = targetAdminUser?.id || ADMIN_ROOT_ID;
 
-      const adminId = targetAdminUser?.id || "us_admin_root";
+      // ارتقای خودکار: رمز خام را به bcrypt تبدیل و نسخه‌های متنی را پاک می‌کنیم.
+      // این کار باعث می‌شود سایتِ زنده بدون قطعی، به ذخیره‌سازی امن مهاجرت کند.
+      if (needsHashUpgrade) {
+        const newHash = hashPassword(rawInput);
+        await pool.query("UPDATE users SET password_hash = ? WHERE id = ?", [newHash, adminId]).catch(() => {});
+        await pool.query("DELETE FROM settings WHERE setting_key IN ('adminPassword', 'admin_password')").catch(() => {});
+        try { FileStorage.setSetting("adminPassword", ""); } catch {}
+        try { FileStorage.setSetting("admin_password", ""); } catch {}
+      }
+
       const session = await issueSession(req, res, adminId);
-      await logUserActivity(req, "admin_login", "auth", { phone: "09120947304" }, targetAdminUser);
+      await logUserActivity(req, "admin_login", "auth", { phone: ADMIN_PHONE }, targetAdminUser);
       return res.json({
         status: "ok",
         user: {
           id: adminId,
-          name: targetAdminUser?.full_name || "مدیر کل پلتفرم",
-          full_name: targetAdminUser?.full_name || "مدیر کل پلتفرم",
+          name: targetAdminUser?.full_name || ADMIN_DISPLAY_NAME,
+          full_name: targetAdminUser?.full_name || ADMIN_DISPLAY_NAME,
           role: "admin",
-          phone: targetAdminUser?.phone || "09120947304",
+          phone: targetAdminUser?.phone || ADMIN_PHONE,
           isSuperAdmin: true,
           is_super_admin: true,
         },
@@ -691,12 +737,67 @@ app.post("/api/auth/admin-login", authRateLimit, async (req, res) => {
       });
     }
 
+    await logUserActivity(req, "admin_login_failed", "auth", { ip: clientIp(req) }, null);
     return res.status(401).json({
       status: "error",
       error: "کلمه عبور وارد شده نادرست است!",
     });
   } catch (err: any) {
     return res.status(500).json({ status: "error", error: err.message });
+  }
+});
+
+/**
+ * تغییر رمز مدیر ارشد.
+ *
+ * برخلاف نسخه قبل که رمز فقط در localStorage نوشته می‌شد و از طریق مسیر عمومی
+ * sync بدون دانستن رمز فعلی قابل تعویض بود، اینجا:
+ *   ۱. سشن معتبر مدیر الزامی است (requireAdmin)
+ *   ۲. رمز فعلی باید درست وارد شود
+ *   ۳. رمز جدید حداقل ۸ کاراکتر و فقط به‌صورت bcrypt ذخیره می‌شود
+ *   ۴. همه سشن‌های دیگر ابطال می‌شوند
+ */
+app.post("/api/auth/admin-change-password", requireAdmin, async (req, res) => {
+  try {
+    const currentPassword = String(req.body?.currentPassword || "").trim();
+    const newPassword = String(req.body?.newPassword || "").trim();
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ status: "error", error: "رمز فعلی و رمز جدید هر دو الزامی هستند." });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ status: "error", error: "رمز جدید باید حداقل ۸ کاراکتر باشد." });
+    }
+    if (newPassword === currentPassword) {
+      return res.status(400).json({ status: "error", error: "رمز جدید نباید با رمز فعلی یکسان باشد." });
+    }
+
+    const adminId = String((req as any).user?.id || "");
+    const pool = getDbPool();
+    const [rows]: any = await pool.query("SELECT password_hash FROM users WHERE id = ? LIMIT 1", [adminId]).catch(() => [[], []]);
+    const storedHash = rows && rows.length > 0 ? rows[0].password_hash : null;
+
+    if (!storedHash || !verifyPassword(currentPassword, storedHash)) {
+      await logUserActivity(req, "admin_password_change_failed", "auth", { ip: clientIp(req) }, (req as any).user);
+      return res.status(401).json({ status: "error", error: "رمز فعلی نادرست است." });
+    }
+
+    const newHash = hashPassword(newPassword);
+    await pool.query("UPDATE users SET password_hash = ? WHERE id = ?", [newHash, adminId]);
+    // پاک‌کردن هر نسخهٔ متنی باقی‌مانده از رمز در جدول settings و فایل JSON
+    await pool.query("DELETE FROM settings WHERE setting_key IN ('adminPassword', 'admin_password')").catch(() => {});
+    try { FileStorage.setSetting("adminPassword", ""); } catch {}
+    try { FileStorage.setSetting("admin_password", ""); } catch {}
+
+    // ابطال همه سشن‌های قبلی مدیر — اگر رمز لو رفته بود، مهاجم خارج می‌شود.
+    await pool.query("DELETE FROM sessions WHERE user_id = ?", [adminId]).catch(() => {});
+
+    await logUserActivity(req, "admin_password_changed", "auth", null, (req as any).user);
+    const session = await issueSession(req, res, adminId);
+    return res.json({ status: "ok", message: "رمز مدیر با موفقیت تغییر کرد. سایر دستگاه‌ها خارج شدند.", ...session });
+  } catch (err: any) {
+    console.error("[admin-change-password] error:", err?.message);
+    return res.status(500).json({ status: "error", error: "خطا در تغییر رمز مدیر." });
   }
 });
 
@@ -804,7 +905,19 @@ app.post("/api/auth/login", authRateLimit, async (req, res) => {
 
     const isMatch = verifyPassword(String(password), String(storedHash));
     if (!isMatch) {
+      await logUserActivity(req, "user_login_failed", "auth", { phone: cleanPhone, ip: clientIp(req) }, null);
       return res.status(401).json({ status: "error", message: "کلمه عبور وارد شده نادرست است", error: "کلمه عبور وارد شده نادرست است" });
+    }
+
+    // ارتقای خودکار رمزهای خامِ میراثی به bcrypt در اولین ورود موفق.
+    // بدین ترتیب پایگاه دادهٔ زنده بدون هیچ قطعی به ذخیره‌سازی امن مهاجرت می‌کند.
+    if (needsRehash(String(storedHash))) {
+      const upgradedHash = hashPassword(String(password));
+      if (rawUser?.id) {
+        await pool.query("UPDATE users SET password_hash = ? WHERE id = ?", [upgradedHash, rawUser.id]).catch(() => {});
+      } else if (rawTech?.id) {
+        await pool.query("UPDATE technicians SET password = ? WHERE id = ?", [upgradedHash, rawTech.id]).catch(() => {});
+      }
     }
 
     const targetUserId = rawUser?.id || (rawTech ? `tech_${rawTech.id}` : "");
@@ -849,11 +962,12 @@ app.post("/api/auth/login", authRateLimit, async (req, res) => {
         status: effectiveTechStatus
       };
     }
-    if (cleanPhone === '09120947304' || userSafe.role === 'admin' || userSafe.is_super_admin) {
+    // ارتقای نقش فقط بر اساس رکورد دیتابیس، نه مقایسه با شماره هاردکدشده.
+    if (isAdminUser(userSafe)) {
       userSafe.role = 'admin';
       userSafe.is_super_admin = true;
       userSafe.isSuperAdmin = true;
-      userSafe.full_name = userSafe.full_name || 'مدیر عالی کدیار۲۴';
+      userSafe.full_name = userSafe.full_name || ADMIN_DISPLAY_NAME;
     }
     delete userSafe.password_hash;
     delete userSafe.password;
@@ -1858,7 +1972,7 @@ app.put("/api/orders/:id", async (req, res) => {
     }
 
     const caller = await getCurrentUserAsync(req).catch(() => null);
-    const isAdmin = caller && (caller.role === 'admin' || caller.is_super_admin || caller.phone === '09120947304');
+    const isAdmin = isAdminUser(caller);
 
     // Security: Prevent client tampering of commission_paid flag
     if (!isAdmin && body.commission_paid !== undefined) {
@@ -3318,7 +3432,9 @@ app.all(["/api/technicians/:id/status", "/api/technicians/status"], async (req, 
 });
 
 // Dedicated verification endpoint for Admin to approve or suspend technician
-app.post(["/api/admin/technicians/:id/verify", "/api/technicians/:id/verify"], async (req, res) => {
+// این مسیر پیش‌تر هیچ احراز هویتی نداشت — هر کسی می‌توانست هر تکنسینی را
+// (از جمله خودش را) تأیید یا مسدود کند. اکنون فقط مدیر مجاز است.
+app.post(["/api/admin/technicians/:id/verify", "/api/technicians/:id/verify"], requireAdmin, async (req, res) => {
   try {
     const targetId = String(req.params.id || req.body.id || "").trim();
     const { isVerified, status } = req.body || {};
@@ -3758,23 +3874,11 @@ app.get(["/api/announcements", "/api/admin/broadcasts", "/api/broadcasts"], asyn
 
 app.post(["/api/admin/broadcasts", "/api/announcements", "/api/broadcasts"], async (req, res) => {
   try {
+    // احراز هویت فقط از طریق سشن معتبرِ صادرشده توسط سرور.
+    // پیش‌تر ارسال رشته‌ی ثابتِ "us_admin_root" در هدر، بدون هیچ رمزی، دسترسی
+    // مدیر می‌داد و هر کسی می‌توانست پیام همگانی بفرستد.
     const rawUser = await getCurrentUserAsync(req).catch(() => null);
-    const sessionHeader = req.headers["x-session-token"] || req.headers["x-access-token"] || "";
-    
-    // Validate admin authority (supporting Bearer token, session cookie, and X-Session-Token)
-    let isAuthorized = Boolean(rawUser && (rawUser.role === "admin" || rawUser.is_super_admin || rawUser.phone === "09120947304"));
-    if (!isAuthorized && sessionHeader) {
-      const tokenStr = Array.isArray(sessionHeader) ? sessionHeader[0] : String(sessionHeader).trim();
-      if (tokenStr === "admin" || tokenStr === "us_admin_root" || tokenStr.startsWith("us_admin") || tokenStr === "09120947304") {
-        isAuthorized = true;
-      } else {
-        const u = await UserRepository.findById(tokenStr).catch(() => null)
-          || await UserRepository.findByPhone(tokenStr).catch(() => null);
-        if (u && (u.role === "admin" || u.is_super_admin || u.phone === "09120947304")) {
-          isAuthorized = true;
-        }
-      }
-    }
+    const isAuthorized = isAdminUser(rawUser);
 
     if (!isAuthorized) {
       return res.status(403).json({ status: "error", message: "دسترسی غیرمجاز. فقط مدیر سیستم مجاز به ارسال پیام همگانی است." });
@@ -3825,16 +3929,9 @@ app.post(["/api/admin/broadcasts", "/api/announcements", "/api/broadcasts"], asy
 
 app.delete(["/api/admin/broadcasts/:id", "/api/broadcasts/:id"], async (req, res) => {
   try {
+    // احراز هویت فقط از سشن معتبر (در پشتی توکن ثابت حذف شد)
     const rawUser = await getCurrentUserAsync(req).catch(() => null);
-    const sessionHeader = req.headers["x-session-token"] || req.headers["x-access-token"] || "";
-    let isAuthorized = Boolean(rawUser && (rawUser.role === "admin" || rawUser.is_super_admin));
-    if (!isAuthorized && sessionHeader) {
-      const tokenStr = Array.isArray(sessionHeader) ? sessionHeader[0] : String(sessionHeader).trim();
-      if (tokenStr === "admin" || tokenStr === "us_admin_root" || tokenStr.startsWith("us_admin")) {
-        isAuthorized = true;
-      }
-    }
-    if (!isAuthorized) {
+    if (!isAdminUser(rawUser)) {
       return res.status(403).json({ status: "error", message: "دسترسی غیرمجاز" });
     }
 
@@ -4028,13 +4125,11 @@ app.post("/api/sync", requireAdmin, async (req, res) => {
     if (modelsList !== undefined) await SettingsRepository.setSetting("modelsList", modelsList);
     if (citiesList !== undefined) await SettingsRepository.setSetting("citiesList", citiesList);
     if (categoryConfig !== undefined) await SettingsRepository.setSetting("categoryConfig", categoryConfig);
-    if (adminPassword && String(adminPassword).trim()) {
-      const hashedPass = hashPassword(String(adminPassword).trim());
-      await SettingsRepository.setSetting("adminPassword", hashedPass);
-      const adminUser = await UserRepository.findByPhone("09120947304");
-      if (adminUser) {
-        await UserRepository.update(adminUser.id, { password_hash: hashedPass });
-      }
+    // تغییر رمز مدیر از این مسیر حذف شد. مسیر اختصاصی و امنِ
+    // POST /api/auth/admin-change-password را به‌جای آن به کار ببرید — آن مسیر
+    // رمز فعلی را می‌خواهد و سشن‌های دیگر را ابطال می‌کند.
+    if (adminPassword !== undefined) {
+      console.warn("[sync] تلاش برای تغییر رمز مدیر از مسیر sync نادیده گرفته شد.");
     }
 
     return res.json({ status: "ok", message: "همگام‌سازی کامل با پایگاه داده انجام شد" });
@@ -4819,12 +4914,10 @@ app.post("/api/tickets/:id/reply", async (req, res) => {
       return res.status(400).json({ success: false, status: "error", error: "متن پیام نمی‌تواند خالی باشد." });
     }
     const user = await getCurrentUserAsync(req).catch(() => null);
-    const sessionTokenHeader = String(req.headers["x-session-token"] || req.headers["x-access-token"] || "").trim();
-    const authHeader = String(req.headers.authorization || "").trim();
-    const isDirectAdminToken = sessionTokenHeader === "us_admin_root" || authHeader === "Bearer us_admin_root" || authHeader === "us_admin_root";
-    const isAdminUser = isDirectAdminToken || user?.role === "admin" || Boolean(user?.is_super_admin);
+    // در پشتی حذف شد: توکن ثابت «us_admin_root» به هر کسی اجازه پاسخ مدیریتی می‌داد.
+    const isAdminCaller = isAdminUser(user);
 
-    if (!isAdminUser) {
+    if (!isAdminCaller) {
       const ticket = await TicketRepository.findById(ticketId);
       if (!ticket) {
         return res.status(404).json({ success: false, status: "error", error: "تیکت یافت نشد." });
@@ -4846,8 +4939,8 @@ app.post("/api/tickets/:id/reply", async (req, res) => {
       }
     }
 
-    const senderType = isAdminUser ? "admin" : "user";
-    const senderUserId = user?.id || user?.phone || (isAdminUser ? "admin" : "user");
+    const senderType = isAdminCaller ? "admin" : "user";
+    const senderUserId = user?.id || user?.phone || (isAdminCaller ? "admin" : "user");
     
     const updatedTicket = await TicketRepository.addReply(ticketId, {
       user_id: senderUserId,
@@ -4965,10 +5058,8 @@ app.post(["/api/technicians/settle-commission", "/api/wallet/settle-commission"]
       return res.status(404).json({ status: "error", message: "تکنسین یافت نشد." });
     }
 
-    const sessionTokenHeader = String(req.headers["x-session-token"] || req.headers["x-access-token"] || "").trim();
-    const authHeader = String(req.headers.authorization || "").trim();
-    const isDirectAdminToken = sessionTokenHeader === "us_admin_root" || authHeader === "Bearer us_admin_root" || authHeader === "us_admin_root";
-    const isAdmin = isDirectAdminToken || user?.role === "admin" || Boolean(user?.is_super_admin);
+    // در پشتی حذف شد: توکن ثابت «us_admin_root» اجازهٔ تسویهٔ مالی هر تکنسینی را می‌داد.
+    const isAdmin = isAdminUser(user);
 
     if (!isAdmin && user) {
       const loggedId = user?.id ? String(user.id) : "";
@@ -5274,61 +5365,48 @@ app.get(["/api/subscription/plans", "/api/subscriptions/plans"], (req, res) => {
 
 app.get(["/api/payments", "/api/admin/payments"], async (req, res) => {
   try {
+    // در نسخه قبل هر مقدار غیرخالی در هدر X-Admin-Password (حتی حرف "x") و حتی
+    // صرفاً صدا زدن مسیر /api/admin/payments بدون هیچ احراز هویتی، کل سوابق
+    // مالی همه کاربران را برمی‌گرداند. اکنون فقط سشن معتبر ملاک است.
     const user = await getCurrentUserAsync(req).catch(() => null);
-    const adminPassHeader = req.headers["x-admin-password"] || req.headers["x-admin-token"];
-    const isAdmin = (user && (user.role === "admin" || user.is_super_admin)) || Boolean(adminPassHeader);
 
-    if (isAdmin || req.path.includes("/admin/")) {
+    if (!user) {
+      return res.status(401).json({ status: "error", error: "برای مشاهده سوابق پرداخت باید وارد حساب کاربری شوید.", payments: [], data: [] });
+    }
+
+    if (isAdminUser(user)) {
       const payments = await PaymentRepository.findAll();
       return res.json({ status: "ok", payments, data: payments, results: payments, total: payments.length });
     }
 
-    if (user) {
-      const userPayments = await PaymentRepository.findByUserId(user.id, user.phone);
-      return res.json({ status: "ok", payments: userPayments, data: userPayments, results: userPayments, total: userPayments.length });
-    }
-
-    const queryPhone = (req.query.phone || req.query.mobile) as string;
-    const queryUserId = (req.query.userId || req.query.user_id) as string;
-    if (queryPhone || queryUserId) {
-      const filtered = await PaymentRepository.findByUserId(queryUserId || "", queryPhone || "");
-      return res.json({ status: "ok", payments: filtered, data: filtered, results: filtered, total: filtered.length });
-    }
-
-    const payments = await PaymentRepository.findAll().catch(() => []);
-    return res.json({ status: "ok", payments, data: payments, results: payments, total: payments.length });
+    // کاربر عادی فقط سوابق خودش را می‌بیند — پارامترهای phone/userId از کوئری نادیده گرفته می‌شوند.
+    const userPayments = await PaymentRepository.findByUserId(user.id, user.phone);
+    return res.json({ status: "ok", payments: userPayments, data: userPayments, results: userPayments, total: userPayments.length });
   } catch (err: any) {
-    return res.status(500).json({ status: "error", error: err.message, payments: [], data: [] });
+    console.error("[payments] error:", err?.message);
+    return res.status(500).json({ status: "error", error: "خطا در دریافت سوابق پرداخت.", payments: [], data: [] });
   }
 });
 
 app.get(["/api/subscriptions", "/api/admin/subscriptions"], async (req, res) => {
   try {
+    // همان نشت امنیتی مسیر payments: هدر رمز و پسوند مسیر /admin/ دیگر ملاک نیستند.
     const user = await getCurrentUserAsync(req).catch(() => null);
-    const adminPassHeader = req.headers["x-admin-password"] || req.headers["x-admin-token"];
-    const isAdmin = (user && (user.role === "admin" || user.is_super_admin)) || Boolean(adminPassHeader);
 
-    if (isAdmin || req.path.includes("/admin/")) {
+    if (!user) {
+      return res.status(401).json({ status: "error", error: "برای مشاهده اشتراک‌ها باید وارد حساب کاربری شوید.", subscriptions: [], data: [] });
+    }
+
+    if (isAdminUser(user)) {
       const subscriptions = await SubscriptionRepository.findAll();
       return res.json({ status: "ok", subscriptions, data: subscriptions, results: subscriptions, total: subscriptions.length });
     }
 
-    if (user) {
-      const userSubs = await SubscriptionRepository.findByUserId(user.id, user.phone);
-      return res.json({ status: "ok", subscriptions: userSubs, data: userSubs, results: userSubs, total: userSubs.length });
-    }
-
-    const queryPhone = (req.query.phone || req.query.mobile) as string;
-    const queryUserId = (req.query.userId || req.query.user_id) as string;
-    if (queryPhone || queryUserId) {
-      const filtered = await SubscriptionRepository.findByUserId(queryUserId || "", queryPhone || "");
-      return res.json({ status: "ok", subscriptions: filtered, data: filtered, results: filtered, total: filtered.length });
-    }
-
-    const subscriptions = await SubscriptionRepository.findAll().catch(() => []);
-    return res.json({ status: "ok", subscriptions, data: subscriptions, results: subscriptions, total: subscriptions.length });
+    const userSubs = await SubscriptionRepository.findByUserId(user.id, user.phone);
+    return res.json({ status: "ok", subscriptions: userSubs, data: userSubs, results: userSubs, total: userSubs.length });
   } catch (err: any) {
-    return res.status(500).json({ status: "error", error: err.message, subscriptions: [], data: [] });
+    console.error("[subscriptions] error:", err?.message);
+    return res.status(500).json({ status: "error", error: "خطا در دریافت اشتراک‌ها.", subscriptions: [], data: [] });
   }
 });
 

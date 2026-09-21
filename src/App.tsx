@@ -457,9 +457,9 @@ export default function App() {
   });
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [activeToasts, setActiveToasts] = useState<Notification[]>([]);
-  const [adminPassword, setAdminPassword] = useState<string>(() => {
-    return localStorage.getItem('ir_admin_password') || '';
-  });
+  // رمز مدیر هرگز سمت کلاینت نگهداری نمی‌شود. این state فقط برای سازگاری با
+  // امضای کامپوننت‌های موجود باقی مانده و همیشه خالی است.
+  const [adminPassword, setAdminPassword] = useState<string>('');
   const [smsSettings, setSmsSettings] = useState<any>({
     provider: 'simulated',
     apiKey: '',
@@ -818,35 +818,24 @@ const reconcileSubscriptionsWithPayments = (subs: any[], payments: any[]) => {
       return;
     }
     try {
-      const savedLocal = localStorage.getItem('ir_admin_password') || adminPassword || '';
       const response = await fetch('/api/auth/admin-login', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ 
-          password: rawPass,
-          localAdminPassword: savedLocal
-        })
+        credentials: 'include',
+        // رمز فقط یک‌بار و فقط برای احراز هویت ارسال می‌شود؛ دیگر ذخیره نمی‌شود.
+        body: JSON.stringify({ password: rawPass })
       });
       const data = await response.json();
-      if (response.ok && data.status === 'ok') {
-        const userObj = data.user || {
-          id: 'us_admin_root',
-          full_name: 'مدیر کل پلتفرم',
-          name: 'مدیر کل پلتفرم',
-          role: 'admin',
-          phone: '09120947304',
-          is_super_admin: true,
-          isSuperAdmin: true
-        };
+      if (response.ok && data.status === 'ok' && data.user && data.token) {
+        const userObj = data.user;
         localStorage.setItem('session_user_id', String(userObj.id));
-        if (data.token) {
-          localStorage.setItem('access_token', data.token);
-        }
-        localStorage.setItem('ir_admin_password', rawPass);
-        localStorage.setItem('admin_master_password', rawPass);
-        setAdminPassword(rawPass);
+        localStorage.setItem('access_token', data.token);
+        // رمز مدیر عمداً در localStorage ذخیره نمی‌شود — هر اسکریپتی روی صفحه
+        // (و هر XSS) می‌توانست آن را بخواند و برای همیشه دسترسی مدیر بگیرد.
+        localStorage.removeItem('ir_admin_password');
+        localStorage.removeItem('admin_master_password');
         localStorage.setItem('ir_current_role', 'admin');
         localStorage.setItem('ir_role_selection', 'admin');
         setCurrentUser(userObj);
@@ -1245,15 +1234,14 @@ const reconcileSubscriptionsWithPayments = (subs: any[], payments: any[]) => {
     }
     try {
       console.log('[App] Fetching database state from backend modular endpoints...');
-      const sessionToken = localStorage.getItem('session_user_id') || localStorage.getItem('access_token') || 'us_admin_root';
-      const adminPass = localStorage.getItem('ir_admin_password') || '';
-      const headers: Record<string, string> = {
-        'X-Session-Token': sessionToken,
-        'X-Access-Token': localStorage.getItem('access_token') || '',
-        'Authorization': sessionToken ? `Bearer ${sessionToken}` : 'Bearer us_admin_root',
-        'X-Admin-Password': adminPass,
-        'X-Admin-Role': 'admin'
-      };
+      // احراز هویت فقط با توکن سشنِ صادرشده توسط سرور.
+      // حذف شد: ارسال رمز مدیر در هدر و توکن ثابت us_admin_root.
+      const accessToken = localStorage.getItem('access_token') || '';
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (accessToken) {
+        headers['X-Session-Token'] = accessToken;
+        headers['Authorization'] = `Bearer ${accessToken}`;
+      }
 
       // Fast cache check for static data: Error Codes and Common Problems
       const cachedErrorsRaw = localStorage.getItem('ir_errors');
@@ -5157,11 +5145,11 @@ const reconcileSubscriptionsWithPayments = (subs: any[], payments: any[]) => {
                   localStorage.setItem('ir_support_phone', phone);
                   syncWithBackend({ supportPhone: phone });
                 }}
-                onUpdateAdminPassword={(newPass) => {
-                  setAdminPassword(newPass);
-                  localStorage.setItem('ir_admin_password', newPass);
-                  syncWithBackend({ adminPassword: newPass });
-                }}
+                /*
+                 * تغییر رمز مدیر مستقیماً در خود AdminPanel و از طریق مسیر امن
+                 * /api/auth/admin-change-password انجام می‌شود — رمز نه در localStorage
+                 * ذخیره می‌شود و نه از مسیر عمومی sync عبور می‌کند.
+                 */
                 smsSettings={smsSettings}
                 onUpdateSmsSettings={(settings) => {
                   setSmsSettings(settings);

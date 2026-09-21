@@ -9,6 +9,8 @@ import { RepairOrder, ErrorCode, Technician, SparePart, CommonProblem, PartPurch
 import { Shield, Users, User, AlertTriangle, FileCheck, Check, Ban, BarChart3, TrendingUp, Activity, PenTool, Layers, CheckCircle2, DollarSign, X, Info, Key, Eye, Truck, Laptop, Settings, Plus, Trash2, MapPin, Search, FileText, LogOut, MessageSquare, Send, Terminal, CheckCircle, Inbox, ShoppingBag, RefreshCw, Megaphone, Phone, Smartphone, Upload, Edit, Database, ChevronUp, ChevronDown, Save } from 'lucide-react';
 import { DocumentViewer } from './DocumentViewer';
 import { sanitizePhoneInput, validateIranianMobile, validateUrl, harmonizeErrorCode } from './validation';
+import { adminHeaders } from '../utils/auth-headers';
+import { SUPPORT_PHONE } from '../config/admin-client';
 
 const SmartCombobox: React.FC<{
   label: string;
@@ -221,7 +223,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   onUpdateAdminAnnouncement,
   trustBadges = { badge1Link: 'https://enamad.ir', badge1Image: '', badge2Link: 'https://samandehi.ir', badge2Image: '' },
   onUpdateTrustBadges,
-  supportPhone = '09120947304',
+  supportPhone = SUPPORT_PHONE,
   onUpdateSupportPhone,
   pageContents = { aboutUs: '', contactUs: '', rules: '', dispute: '', appDownloadUrl: '' },
   onUpdatePageContents,
@@ -235,7 +237,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   onUpdatePostalTrackCode,
 }) => {
   const [activeTab, setActiveTab] = React.useState<string>('metrics');
-  
+
   // Support Tickets States
   const [adminTicketsList, setAdminTicketsList] = React.useState<any[]>([]);
   const [adminTicketsLoading, setAdminTicketsLoading] = React.useState(false);
@@ -775,19 +777,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
       `آیا از حذف دائم کاربر "${userName}" (${user.phone}) اطمینان قطعی دارید؟ تمام سوابق، اشتراک‌ها، سفارش‌ها، سوابق پرداخت و پرونده تکنسین/مشتری به صورت برگشت‌ناپذیر از کل سیستم و پایگاه داده پاک خواهند شد.`,
       async () => {
         try {
-          const token = localStorage.getItem('session_user_id') || localStorage.getItem('token') || localStorage.getItem('access_token') || 'us_admin_root';
           const targetId = user.id || user.phone;
-          const masterPass = adminPassword || localStorage.getItem('admin_master_password') || localStorage.getItem('ir_admin_password') || '';
+          // احراز هویت فقط با توکن سشن؛ رمز مدیر دیگر روی شبکه ارسال نمی‌شود.
           const res = await fetch(`/api/admin/users/${encodeURIComponent(targetId)}`, {
             method: 'DELETE',
-            headers: { 
-              'Content-Type': 'application/json',
-              'X-Session-Token': token,
-              'X-User-Id': token,
-              'X-Admin-Password': masterPass,
-              'X-Admin-Role': 'admin',
-              'Authorization': `Bearer ${token}`
-            },
+            headers: adminHeaders(),
             credentials: 'include'
           });
           const data = await res.json().catch(() => ({}));
@@ -795,14 +789,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
           // Also trigger technician deletion endpoint to ensure full cascade
           await fetch(`/api/admin/technicians/${encodeURIComponent(targetId)}`, {
             method: 'DELETE',
-            headers: { 
-              'Content-Type': 'application/json',
-              'X-Session-Token': token,
-              'X-User-Id': token,
-              'X-Admin-Password': masterPass,
-              'X-Admin-Role': 'admin',
-              'Authorization': `Bearer ${token}`
-            },
+            headers: adminHeaders(),
             credentials: 'include'
           }).catch(() => {});
 
@@ -1430,35 +1417,60 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const [newAdminPass, setNewAdminPass] = React.useState('');
   const [newAdminPassConfirm, setNewAdminPassConfirm] = React.useState('');
 
-  const handleChangeAdminPass = () => {
+  /**
+   * تغییر رمز مدیر ارشد.
+   *
+   * اعتبارسنجی رمز فعلی فقط سمت سرور انجام می‌شود. نسخه قبلی آن را با یک
+   * مقدار localStorage مقایسه می‌کرد — یعنی هر کسی با ویرایش آن مقدار در کنسول
+   * مرورگر، می‌توانست بدون دانستن رمز واقعی، رمز مدیر را عوض کند.
+   */
+  const handleChangeAdminPass = async () => {
     setAdminPassMessage(null);
-    const savedAdminPassword = adminPassword || '';
     if (!currentAdminPass) {
-      alert('لطفاً کلمه عبور فعلی مدیریت را وارد فرمایید.');
-      return;
-    }
-    if (currentAdminPass !== savedAdminPassword) {
-      alert('کلمه عبور فعلی وارد شده نادرست است!');
+      setAdminPassMessage({ type: 'error', text: 'لطفاً کلمه عبور فعلی مدیریت را وارد فرمایید.' });
       return;
     }
     if (!newAdminPass.trim()) {
-      alert('لطفاً کلمه عبور جدید را وارد فرمایید.');
+      setAdminPassMessage({ type: 'error', text: 'لطفاً کلمه عبور جدید را وارد فرمایید.' });
+      return;
+    }
+    if (newAdminPass.trim().length < 8) {
+      setAdminPassMessage({ type: 'error', text: 'کلمه عبور جدید باید حداقل ۸ کاراکتر باشد.' });
       return;
     }
     if (newAdminPass !== newAdminPassConfirm) {
-      alert('رمز عبور جدید با تاییدیه آن مطابقت ندارد!');
+      setAdminPassMessage({ type: 'error', text: 'رمز عبور جدید با تاییدیه آن مطابقت ندارد!' });
       return;
     }
-    if (onUpdateAdminPassword) {
-      onUpdateAdminPassword(newAdminPass.trim());
-    } else {
-      localStorage.setItem('ir_admin_password', newAdminPass.trim());
+
+    try {
+      const res = await fetch('/api/auth/admin-change-password', {
+        method: 'POST',
+        headers: adminHeaders(),
+        credentials: 'include',
+        body: JSON.stringify({
+          currentPassword: currentAdminPass,
+          newPassword: newAdminPass.trim()
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok || data.status !== 'ok') {
+        setAdminPassMessage({ type: 'error', text: data.error || 'تغییر رمز انجام نشد.' });
+        return;
+      }
+
+      // سرور سشن‌های قبلی را ابطال کرده و توکن تازه صادر کرده است.
+      if (data.token) {
+        localStorage.setItem('access_token', data.token);
+      }
+      setAdminPassMessage({ type: 'success', text: 'کلمه عبور مدیر ارشد تغییر یافت. سایر دستگاه‌ها از حساب خارج شدند.' });
+      setCurrentAdminPass('');
+      setNewAdminPass('');
+      setNewAdminPassConfirm('');
+    } catch (e: any) {
+      setAdminPassMessage({ type: 'error', text: `خطا در ارتباط با سرور: ${e?.message || e}` });
     }
-    setAdminPassMessage({ type: 'success', text: 'کلمه عبور مدیر ارشد با موفقیت تغییر یافت. کلمه عبور جدید ثبت شد.' });
-    alert('کلمه عبور مدیر ارشد با موفقیت تغییر یافت. از این پس برای ورود کلید واژه جدید معتبر خواهد بود.');
-    setCurrentAdminPass('');
-    setNewAdminPass('');
-    setNewAdminPassConfirm('');
   };
 
   // Manual technician insertion form states
@@ -4781,18 +4793,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
                             `آیا از حذف کامل پرونده تکنسین "${t.name}" از شبکه سراسری کدیار۲۴ اطمینان قطعی دارید؟ مأموریت‌های همکار مسدود و اطلاعات وی پاک خواهد شد.`,
                             async () => {
                               try {
-                                const token = localStorage.getItem('session_user_id') || localStorage.getItem('token') || localStorage.getItem('access_token') || 'us_admin_root';
-                                const masterPass = adminPassword || localStorage.getItem('admin_master_password') || localStorage.getItem('ir_admin_password') || '';
                                 const res = await fetch(`/api/admin/technicians/${encodeURIComponent(t.id)}`, {
                                   method: 'DELETE',
-                                  headers: { 
-                                    'Content-Type': 'application/json',
-                                    'X-Session-Token': token,
-                                    'X-User-Id': token,
-                                    'X-Admin-Password': masterPass,
-                                    'X-Admin-Role': 'admin',
-                                    'Authorization': `Bearer ${token}`
-                                  },
+                                  headers: adminHeaders(),
                                   credentials: 'include'
                                 });
                                 const data = await res.json().catch(() => ({}));
@@ -9299,6 +9302,70 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         onUpdateSupportPhone={onUpdateSupportPhone}
       />
 
+      {/* تغییر رمز مدیر ارشد — اعتبارسنجی کاملاً سمت سرور انجام می‌شود */}
+      {activeTab === 'config' && (
+        <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-5 sm:p-6 text-right space-y-4 font-sans">
+          <div className="flex items-center gap-2 pb-3 border-b border-slate-100">
+            <Key className="w-5 h-5 text-indigo-600" />
+            <h3 className="text-sm font-extrabold text-slate-800">تغییر کلمه عبور مدیر ارشد</h3>
+          </div>
+
+          <p className="text-[11px] text-slate-500 leading-relaxed">
+            پس از تغییر رمز، همهٔ دستگاه‌های دیگری که با حساب مدیر وارد شده‌اند به‌صورت خودکار خارج می‌شوند.
+          </p>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="space-y-1.5">
+              <label className="block text-[11px] font-extrabold text-slate-700">رمز فعلی</label>
+              <input
+                type="password"
+                autoComplete="current-password"
+                value={currentAdminPass}
+                onChange={(e) => setCurrentAdminPass(e.target.value)}
+                className="w-full bg-slate-50 border border-slate-200 text-xs px-3.5 py-2.5 rounded-xl outline-none text-right font-mono focus:border-indigo-500 focus:bg-white"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className="block text-[11px] font-extrabold text-slate-700">رمز جدید (حداقل ۸ کاراکتر)</label>
+              <input
+                type="password"
+                autoComplete="new-password"
+                value={newAdminPass}
+                onChange={(e) => setNewAdminPass(e.target.value)}
+                className="w-full bg-slate-50 border border-slate-200 text-xs px-3.5 py-2.5 rounded-xl outline-none text-right font-mono focus:border-indigo-500 focus:bg-white"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className="block text-[11px] font-extrabold text-slate-700">تکرار رمز جدید</label>
+              <input
+                type="password"
+                autoComplete="new-password"
+                value={newAdminPassConfirm}
+                onChange={(e) => setNewAdminPassConfirm(e.target.value)}
+                className="w-full bg-slate-50 border border-slate-200 text-xs px-3.5 py-2.5 rounded-xl outline-none text-right font-mono focus:border-indigo-500 focus:bg-white"
+              />
+            </div>
+          </div>
+
+          {adminPassMessage && (
+            <p className={`text-[11px] font-bold ${adminPassMessage.type === 'success' ? 'text-emerald-600' : 'text-rose-600'}`}>
+              {adminPassMessage.text}
+            </p>
+          )}
+
+          <div className="pt-2 flex justify-end">
+            <button
+              type="button"
+              onClick={handleChangeAdminPass}
+              className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold shadow-md transition flex items-center gap-1.5 cursor-pointer"
+            >
+              <Save className="w-4 h-4" />
+              <span>ثبت رمز جدید</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* MODAL: Edit Error Code Full 10-Field Form */}
       {editingError && (
         <div className="fixed inset-0 z-50 bg-slate-900/70 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 animate-in fade-in duration-150">
@@ -9610,16 +9677,16 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
             {showConfirmModal.requiresPasswordVerify && (
               <div className="space-y-1.5 pt-1">
                 <label className="block text-[11px] font-extrabold text-slate-700">
-                  کلمه عبور مدیریت جهت تأیید قطعی:
+                  جهت تأیید قطعی، عبارت <span className="font-mono text-rose-600">حذف</span> را بنویسید:
                 </label>
                 <input
-                  type="password"
+                  type="text"
                   value={confirmPasswordInput}
                   onChange={(e) => {
                     setConfirmPasswordInput(e.target.value);
                     setConfirmPasswordError('');
                   }}
-                  placeholder="رمز مدیریت..."
+                  placeholder="حذف"
                   className="w-full bg-slate-50 border border-slate-200 text-xs px-3.5 py-2.5 rounded-xl outline-none text-right font-mono focus:border-rose-500 focus:bg-white"
                 />
                 {confirmPasswordError && (
@@ -9639,13 +9706,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
               <button
                 type="button"
                 onClick={() => {
+                  // دروازهٔ «اقدام آگاهانه» — فقط برای جلوگیری از حذف تصادفی.
+                  // پیش‌تر اینجا رمز مدیر با یک مقدار localStorage مقایسه می‌شد که هم
+                  // قابل دستکاری بود و هم حسِ کاذب امنیت می‌داد.
+                  // مجوز واقعی را سرور با requireAdmin بررسی می‌کند.
                   if (showConfirmModal.requiresPasswordVerify) {
-                    if (!confirmPasswordInput.trim()) {
-                      setConfirmPasswordError('لطفاً رمز مدیریت را وارد کنید.');
-                      return;
-                    }
-                    if (adminPassword && confirmPasswordInput !== adminPassword) {
-                      setConfirmPasswordError('رمز مدیریت وارد شده نادرست است.');
+                    if (confirmPasswordInput.trim() !== 'حذف') {
+                      setConfirmPasswordError('برای تأیید، دقیقاً عبارت «حذف» را بنویسید.');
                       return;
                     }
                   }
